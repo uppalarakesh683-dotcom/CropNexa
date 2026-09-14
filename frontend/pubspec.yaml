@@ -16,6 +16,9 @@ dependencies:
   geocoding: ^5.0.0
   http: ^1.5.0
   speech_to_text: ^7.4.0
+  google_sign_in: ^7.2.0
+  image_picker: ^1.2.3
+  
 
 dev_dependencies:
   flutter_test:
