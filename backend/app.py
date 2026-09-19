@@ -10,8 +10,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
 
-from google import genai
-from google.genai import types
+from groq import Groq
 
 import mysql.connector
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -22,7 +21,11 @@ from werkzeug.utils import secure_filename
 # ENVIRONMENT
 # ============================================================
 
-load_dotenv()
+load_dotenv(override=False)
+
+print("DEBUG GROQ_CROP_DOCTOR_MODEL =", os.getenv("GROQ_CROP_DOCTOR_MODEL"))
+print("DEBUG GEMINI_API_KEY EXISTS =", bool(os.getenv("GEMINI_API_KEY")))
+
 
 
 # ============================================================
@@ -36,24 +39,29 @@ app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
 
 # ============================================================
-# GEMINI
+# GROQ AI CONFIGURATION
 # ============================================================
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Read the Groq API key from the backend environment variables.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is missing from .env")
+# Stop the backend immediately if the Groq API key is missing.
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY is missing from .env")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Create the Groq client used by the AI Assistant and Crop Doctor.
+groq_client = Groq(api_key=GROQ_API_KEY)
 
+# Read the text-chat model from .env, with GPT-OSS 20B as the default.
 CHAT_MODEL = os.getenv(
-    "GEMINI_CHAT_MODEL",
-    "gemini-3.6-flash",
+    "GROQ_CHAT_MODEL",
+    "openai/gpt-oss-20b",
 )
 
+# Read the vision model from .env, using Groq's current Qwen 3.6 27B vision model.
 CROP_DOCTOR_MODEL = os.getenv(
-    "GEMINI_CROP_DOCTOR_MODEL",
-    "gemini-3.6-flash",
+    "GROQ_CROP_DOCTOR_MODEL",
+    "qwen/qwen3.6-27b",
 )
 
 
@@ -154,11 +162,13 @@ print(
     DB_NAME,
 )
 
+# Print the configured text model so deployment logs show which model is active.
 print(
     "CROPNEXA CHAT MODEL:",
     CHAT_MODEL,
 )
 
+# Print the configured vision model so deployment logs show which model is active.
 print(
     "CROPNEXA CROP DOCTOR MODEL:",
     CROP_DOCTOR_MODEL,
@@ -2086,17 +2096,27 @@ def chat():
                 f"{label}: {text}"
             )
 
-        response = (
-            client.models.generate_content(
-                model=CHAT_MODEL,
-                contents="\n".join(
-                    chat_contents
-                ),
-            )
+        # Send the recent CropNexa conversation to the Groq text model.
+        response = groq_client.chat.completions.create(
+            # Select the model configured in the .env file.
+            model=CHAT_MODEL,
+            # Send the conversation as one user message because the existing
+            # backend already builds the complete conversation context.
+            messages=[
+                {
+                    # Mark this message as the user request/context.
+                    "role": "user",
+                    # Provide the existing CropNexa farmer-assistant context.
+                    "content": "\n".join(chat_contents),
+                }
+            ],
+            # Limit the maximum generated response length.
+            max_completion_tokens=2048,
         )
 
+        # Read the generated text from Groq's first response choice.
         ai_reply = (
-            response.text
+            response.choices[0].message.content
             or ""
         )
 
@@ -3332,7 +3352,7 @@ def extract_json_from_ai(
     if not text:
 
         raise ValueError(
-            "Gemini returned an empty response."
+            "Groq returned an empty response."
         )
 
     cleaned = text.strip()
@@ -3379,7 +3399,7 @@ def extract_json_from_ai(
     ):
 
         raise ValueError(
-            "Gemini did not return valid JSON."
+            "Groq did not return valid JSON."
         )
 
     possible_json = cleaned[
@@ -3389,42 +3409,70 @@ def extract_json_from_ai(
     return json.loads(
         possible_json
     )
-
-
-def normalize_list(
-    value
-):
+def normalize_list(value):
 
     if value is None:
-
         return []
 
-    if isinstance(
-        value,
-        list,
-    ):
+    if isinstance(value, list):
+        result = []
 
-        return [
-            str(item).strip()
-            for item in value
-            if str(item).strip()
-        ]
+        for item in value:
+            if isinstance(item, str):
+                item = item.strip()
 
-    if isinstance(
-        value,
-        str,
-    ):
+                # Handle strings that contain JSON arrays
+                if item.startswith("[") and item.endswith("]"):
+                    try:
+                        decoded = json.loads(item)
+
+                        if isinstance(decoded, list):
+                            result.extend(
+                                str(x).strip()
+                                for x in decoded
+                                if str(x).strip()
+                            )
+                            continue
+
+                    except Exception:
+                        pass
+
+                if item:
+                    result.append(item)
+
+            else:
+                item_text = str(item).strip()
+
+                if item_text:
+                    result.append(item_text)
+
+        return result
+
+    if isinstance(value, str):
 
         text = value.strip()
 
         if not text:
-
             return []
 
+        # Convert JSON array text into a real Python list
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                decoded = json.loads(text)
+
+                if isinstance(decoded, list):
+                    return [
+                        str(item).strip()
+                        for item in decoded
+                        if str(item).strip()
+                    ]
+
+            except Exception:
+                pass
+
+        # Handle normal line-by-line text
         lines = [
-            line.strip(
-                " -*•\t"
-            )
+            line.strip(" -*•\t")
             for line in text.splitlines()
         ]
 
@@ -3435,7 +3483,6 @@ def normalize_list(
         ]
 
         if lines:
-
             return lines
 
         return [text]
@@ -3443,53 +3490,31 @@ def normalize_list(
     return [
         str(value).strip()
     ]
-
-
-def safe_confidence(
-    value
-):
+def safe_confidence(value):
 
     if value is None:
-
         return None
 
     try:
-
-        confidence = float(
-            value
-        )
-
+        confidence = float(value)
     except Exception:
-
         return None
 
     if confidence < 0:
-
         confidence = 0
 
     if confidence > 100:
-
         confidence = 100
 
-    return round(
-        confidence,
-        2,
-    )
+    return round(confidence, 2)
 
 
-def serialize_datetime(
-    value
-):
+def serialize_datetime(value):
 
-    if isinstance(
-        value,
-        datetime,
-    ):
-
+    if isinstance(value, datetime):
         return value.isoformat()
 
     return value
-
 
 def build_crop_doctor_response(
     row,
@@ -3792,37 +3817,70 @@ Return exactly:
 }}
 """
 
-        image_part = (
-            types.Part.from_bytes(
-                data=image_bytes,
-                mime_type=mime_type,
-            )
+        # Convert the uploaded image bytes to Base64 because Groq accepts
+        # locally stored images through a data URL in the multimodal request.
+        import base64
+
+        # Encode the binary image into a text-safe Base64 string.
+        base64_image = base64.b64encode(
+            image_bytes
+        ).decode("utf-8")
+
+        # Build a data URL containing the original image MIME type.
+        image_data_url = (
+            f"data:{mime_type};base64,{base64_image}"
         )
 
+        # Log that the Crop Doctor is about to send the image to Groq.
         print(
-            "CROP DOCTOR: Sending image to Gemini"
+            "CROP DOCTOR: Sending image to Groq"
         )
 
-        response = (
-            client.models.generate_content(
-                model=CROP_DOCTOR_MODEL,
-                contents=[
-                    image_part,
-                    prompt,
-                ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                ),
-            )
+        # Send both the farmer's crop type and the image to the Groq vision model.
+        response = groq_client.chat.completions.create(
+            # Select the vision model configured in the .env file.
+            model=CROP_DOCTOR_MODEL,
+            # Send the prompt and image as multimodal content.
+            messages=[
+                {
+                    # Mark this as the CropNexa AI user request.
+                    "role": "user",
+                    # Provide text instructions and the uploaded crop image.
+                    "content": [
+                        {
+                            # Tell Groq that this content item is text.
+                            "type": "text",
+                            # Send the existing Crop Doctor analysis prompt.
+                            "text": prompt,
+                        },
+                        {
+                            # Tell Groq that this content item is an image.
+                            "type": "image_url",
+                            # Provide the Base64 data URL for the uploaded image.
+                            "image_url": {
+                                "url": image_data_url,
+                            },
+                        },
+                    ],
+                }
+            ],
+            # Request JSON so the existing parser can process the AI result.
+            response_format={
+                "type": "json_object",
+            },
+            # Limit the generated Crop Doctor result size.
+            max_completion_tokens=2048,
         )
 
+        # Read the generated JSON text from Groq's first response choice.
         raw_response = (
-            response.text
+            response.choices[0].message.content
             or ""
         )
 
+        # Log that Groq returned the Crop Doctor response.
         print(
-            "CROP DOCTOR: Gemini response received"
+            "CROP DOCTOR: Groq response received"
         )
 
         ai_data = (
@@ -3882,7 +3940,7 @@ Return exactly:
         if not diagnosis:
 
             raise ValueError(
-                "Gemini returned no diagnosis."
+                "Groq returned no diagnosis."
             )
 
         if not english_result:
